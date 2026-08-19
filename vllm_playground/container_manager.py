@@ -302,8 +302,11 @@ class VLLMContainerManager:
 
         # --shm-size is deliberately not emitted: it is incompatible with
         # --ipc=host, which start_container always sets. docker-compose.qwen.yml
-        # declares both but docker ignores shm_size under ipc: host, so
-        # honouring --ipc=host is what actually matches the control layer.
+        # declares both, and docker records the declared value in
+        # HostConfig.ShmSize -- but it does not take effect: measured inside the
+        # control layer's container, /dev/shm is the host's 16G, not the 32gb
+        # the compose file asks for. Honouring --ipc=host is what actually
+        # matches the running service.
         if host.get("SHM_SIZE"):
             logger.info(f"Profile sets SHM_SIZE={host['SHM_SIZE']}, ignored because --ipc=host takes precedence")
 
