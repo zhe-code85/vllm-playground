@@ -3571,7 +3571,7 @@ async def start_server(config: VLLMConfig):
                 await broadcast_log(
                     f"[WEBUI] 🔗 Adopted running container {container_info['name']} ({container_id[:12]}) "
                     f"— started by the control layer, left untouched. "
-                    f"Use an explicit rebuild to apply a different configuration."
+                    f"Stop it first if you want to apply a different configuration."
                 )
             elif container_info.get("reused", False):
                 await broadcast_log(f"[WEBUI] ⚡ Restarted existing container: {container_id[:12]} (fast!)")

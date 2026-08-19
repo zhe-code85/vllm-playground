@@ -571,12 +571,17 @@ class VLLMContainerManager:
             # something else -- the control layer's compose file or
             # start-qwen.sh. Adopt it for observation rather than destroying a
             # live service to apply a config it may already be running.
-            # Applying a new config is then an explicit user action.
+            #
+            # This wins over the config-hash comparison below, so selecting a
+            # different profile does not rebuild an adopted container either.
+            # That is deliberate: the only way to replace a service someone
+            # else started is to stop it first, which is a separate, explicit
+            # user action.
             if state == "running" and not stored_hash:
                 logger.info(
                     f"Container '{target_name}' is running but was not started by Playground "
                     f"(no vllm.config.hash label) - adopting it instead of recreating. "
-                    f"Use the explicit rebuild action to apply a different configuration."
+                    f"Stop it first to apply a different configuration."
                 )
                 return False
 
