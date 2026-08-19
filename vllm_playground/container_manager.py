@@ -782,7 +782,7 @@ class VLLMContainerManager:
                 # Wait for readiness if requested
                 if wait_ready:
                     port = vllm_config.get("port", 8000)
-                    readiness = await self.wait_for_ready(port=port, timeout=ready_timeout)
+                    readiness = await self.wait_for_ready(port=port, timeout=ready_timeout, container_name=target_name)
                     result.update(readiness)
 
                 return result
@@ -946,7 +946,7 @@ class VLLMContainerManager:
             # Wait for readiness if requested
             if wait_ready:
                 port = vllm_config.get("port", 8000)
-                readiness = await self.wait_for_ready(port=port, timeout=ready_timeout)
+                readiness = await self.wait_for_ready(port=port, timeout=ready_timeout, container_name=target_name)
                 result.update(readiness)
 
             return result
@@ -958,7 +958,9 @@ class VLLMContainerManager:
             logger.error(f"Unexpected error starting container: {e}")
             raise
 
-    async def wait_for_ready(self, port: int = 8000, timeout: int = 120) -> Dict[str, Any]:
+    async def wait_for_ready(
+        self, port: int = 8000, timeout: int = 120, container_name: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Wait for vLLM service inside container to be ready
 
@@ -968,6 +970,9 @@ class VLLMContainerManager:
         Args:
             port: Port where vLLM is listening (default: 8000)
             timeout: Maximum time to wait in seconds (default: 120)
+            container_name: Container to watch (default: CONTAINER_NAME). Must be
+                passed when running a profile, otherwise the liveness probe
+                inspects the wrong container and reports it as stopped.
 
         Returns:
             Dictionary with status:
@@ -988,7 +993,7 @@ class VLLMContainerManager:
         while time.time() - start_time < timeout:
             try:
                 # Check if container is still running
-                status = await self.get_container_status()
+                status = await self.get_container_status(container_name=container_name)
                 if not status.get("running", False):
                     elapsed = time.time() - start_time
                     return {"ready": False, "error": "container_stopped", "elapsed_time": round(elapsed, 1)}
