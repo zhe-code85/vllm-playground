@@ -174,6 +174,14 @@ class VLLMWebUI {
 
             // Venv path (for custom vLLM installations)
             venvPathGroup: document.getElementById('venv-path-group'),
+
+            // Deployment profile
+            profileGroup: document.getElementById('profile-group'),
+            profileSelect: document.getElementById('profile-select'),
+            profileSummary: document.getElementById('profile-summary'),
+            profileHelpText: document.getElementById('profile-help-text'),
+            containerImage: document.getElementById('container-image'),
+            containerImageGroup: document.getElementById('container-image-group'),
             venvPathInput: document.getElementById('venv-path'),
 
             // GPU settings
@@ -687,6 +695,7 @@ class VLLMWebUI {
                 vllm_run_mode: 'remote',
                 vllm_remote_url: '',
                 vllm_remote_api_key: '',
+                vllm_profile: '',
                 omni_run_mode: 'remote',
                 omni_remote_url: '',
                 omni_remote_api_key: ''
@@ -762,8 +771,161 @@ class VLLMWebUI {
         // Show "Settings saved" indicator if remote URL is saved
         this.updateSettingsSavedIndicator(settings.vllm_remote_url);
 
+        // Deployment profiles. Populate first, then restore the saved selection
+        // -- setting select.value before the options exist would silently drop it.
+        await this.loadProfiles();
+        if (settings.vllm_profile && this.elements.profileSelect) {
+            const exists = Array.from(this.elements.profileSelect.options)
+                .some(o => o.value === settings.vllm_profile);
+            if (exists) {
+                this.elements.profileSelect.value = settings.vllm_profile;
+                await this.onProfileChange();
+            } else {
+                console.warn(`Saved profile "${settings.vllm_profile}" no longer exists`);
+            }
+        }
+
         // Store settings for Omni module to consume
         this._serverSettings = settings;
+    }
+
+    /**
+     * Fields a profile takes over. Listed by id rather than wrapped in a
+     * container so the form's existing layout and show/hide logic stay intact.
+     */
+    static PROFILE_MANAGED_FIELDS = [
+        'model-select', 'custom-model', 'modelscope-model-select', 'local-model-path',
+        'hf-token', 'modelscope-token', 'dtype', 'max-model-len', 'tensor-parallel',
+        'gpu-memory', 'trust-remote-code', 'enable-prefix-caching', 'enable-tool-calling',
+        'tool-call-parser', 'served-model-name', 'spec-decode-method', 'speculative-model',
+        'num-speculative-tokens', 'draft-tensor-parallel-size', 'prompt-lookup-max',
+        'host', 'port',
+    ];
+
+    /**
+     * Load the list of deployment profiles into the dropdown.
+     */
+    async loadProfiles() {
+        const select = this.elements.profileSelect;
+        if (!select) return;
+
+        let data;
+        try {
+            const resp = await fetch('/api/profiles');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            data = await resp.json();
+        } catch (e) {
+            console.warn('Failed to load deployment profiles:', e);
+            return;
+        }
+
+        const previous = select.value;
+        select.innerHTML = '<option value="">Manual configuration (no profile)</option>';
+        (data.profiles || []).forEach(name => {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            select.appendChild(opt);
+        });
+
+        if (previous && (data.profiles || []).includes(previous)) {
+            select.value = previous;
+        }
+
+        if (this.elements.profileHelpText && (!data.profiles || data.profiles.length === 0)) {
+            this.elements.profileHelpText.textContent =
+                `No profiles found in ${data.dir} (looking for .env.* files).`;
+        }
+    }
+
+    /**
+     * React to a profile selection: fetch its contents, show them read-only,
+     * and lock the fields the profile now owns.
+     */
+    async onProfileChange() {
+        const select = this.elements.profileSelect;
+        if (!select) return;
+        const name = select.value;
+
+        this.saveSettings({ vllm_profile: name });
+
+        if (this.elements.containerImageGroup) {
+            this.elements.containerImageGroup.style.display = name ? 'block' : 'none';
+        }
+
+        if (!name) {
+            if (this.elements.profileSummary) {
+                this.elements.profileSummary.style.display = 'none';
+            }
+            this.applyProfileLock(false);
+            this.updateCommandPreview();
+            return;
+        }
+
+        let profile;
+        try {
+            const resp = await fetch(`/api/profiles/${encodeURIComponent(name)}`);
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            profile = await resp.json();
+        } catch (e) {
+            console.warn(`Failed to load profile ${name}:`, e);
+            if (this.elements.profileSummary) {
+                this.elements.profileSummary.textContent = `Could not read profile "${name}".`;
+                this.elements.profileSummary.style.display = 'block';
+            }
+            return;
+        }
+
+        // Prefill the image so it is visible, but leave it editable: an empty
+        // field falls back to the profile's value anyway.
+        if (this.elements.containerImage && !this.elements.containerImage.value.trim()) {
+            this.elements.containerImage.value = (profile.host && profile.host.QWEN_IMAGE) || '';
+        }
+
+        this.renderProfileSummary(profile);
+        this.applyProfileLock(true);
+        this.updateCommandPreview();
+    }
+
+    /**
+     * Render a profile's parsed contents as a read-only table.
+     */
+    renderProfileSummary(profile) {
+        const box = this.elements.profileSummary;
+        if (!box) return;
+
+        const esc = (v) => String(v).replace(/[&<>"]/g, c => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
+        ));
+        const rows = (section) => Object.keys(section || {}).sort().map(k =>
+            `<tr><td style="padding:2px 12px 2px 0;color:var(--text-secondary,#94a3b8);white-space:nowrap;">${esc(k)}</td>` +
+            `<td style="padding:2px 0;font-family:monospace;word-break:break-all;">${esc(section[k])}</td></tr>`
+        ).join('');
+
+        box.innerHTML =
+            `<div style="margin-bottom:6px;"><strong>${esc(profile.name)}</strong> ` +
+            `<span style="color:var(--text-secondary,#94a3b8);font-family:monospace;">${esc(profile.path)}</span></div>` +
+            `<div style="margin:8px 0 4px;font-weight:600;">Engine parameters (passed to the in-container launcher)</div>` +
+            `<table style="width:100%;font-size:12px;">${rows(profile.container)}</table>` +
+            `<div style="margin:10px 0 4px;font-weight:600;">Host settings (docker run)</div>` +
+            `<table style="width:100%;font-size:12px;">${rows(profile.host)}</table>`;
+        box.style.display = 'block';
+    }
+
+    /**
+     * Disable or re-enable the form fields a profile owns.
+     */
+    applyProfileLock(locked) {
+        VLLMWebUI.PROFILE_MANAGED_FIELDS.forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.disabled = locked;
+            const group = el.closest('.form-group');
+            if (group) {
+                group.style.opacity = locked ? '0.5' : '';
+                group.title = locked ? 'Managed by the selected deployment profile' : '';
+            }
+        });
     }
 
     /**
@@ -1516,6 +1678,11 @@ number ::= [0-9]+`
                 this.updateAcceleratorHelpText();
                 this.updateCommandPreview();
             });
+        }
+
+        // Deployment profile selection
+        if (this.elements.profileSelect) {
+            this.elements.profileSelect.addEventListener('change', () => this.onProfileChange());
         }
 
         // Run mode toggle
@@ -2330,6 +2497,17 @@ number ::= [0-9]+`
             this.elements.remoteSettingsGroup.style.display = isRemote ? 'block' : 'none';
         }
 
+        // Profiles apply to container mode only -- the host has no vLLM
+        // installation for the subprocess path to use.
+        if (this.elements.profileGroup) {
+            this.elements.profileGroup.style.display = isContainer ? 'block' : 'none';
+        }
+        if (!isContainer) {
+            this.applyProfileLock(false);
+        } else if (this.elements.profileSelect && this.elements.profileSelect.value) {
+            this.applyProfileLock(true);
+        }
+
         if (isSubprocess) {
             // Show venv path option only in subprocess mode
             if (this.elements.venvPathGroup) {
@@ -2889,6 +3067,19 @@ number ::= [0-9]+`
             const gpuDevice = this.elements.gpuDevice.value.trim();
             if (gpuDevice) {
                 config.gpu_device = gpuDevice;
+            }
+        }
+
+        // A profile replaces every model/engine field above -- the backend
+        // ignores them and the in-container launcher builds the vllm argv from
+        // the profile instead. They are still sent so the instance registry has
+        // something to show if the profile is later cleared.
+        const profile = this.elements.profileSelect ? this.elements.profileSelect.value : '';
+        if (profile && runMode === 'container') {
+            config.profile = profile;
+            const image = this.elements.containerImage ? this.elements.containerImage.value.trim() : '';
+            if (image) {
+                config.image = image;
             }
         }
 
@@ -4739,6 +4930,25 @@ ${fullText.substring(0, 200)}${fullText.length > 200 ? '...' : ''}`;
     }
 
     updateCommandPreview() {
+        // With a profile the preview would be a lie: the browser has no way to
+        // build the command, because the in-container launcher builds the argv
+        // from the profile's environment variables and this form contributes
+        // none of it. Say that instead of rendering an argv nothing will run.
+        const activeProfile = this.elements.profileSelect ? this.elements.profileSelect.value : '';
+        if (activeProfile && this.elements.runModeContainer && this.elements.runModeContainer.checked) {
+            if (this.elements.commandText) {
+                this.elements.commandText.value =
+                    `# Profile "${activeProfile}" builds the command inside the container
+` +
+                    `# (launch-qwen.sh reads the profile's environment variables).
+` +
+                    `# Preview it on the host with:
+` +
+                    `#   set -a; . <profile-file>; set +a; LAUNCH_DRY_RUN=1 bash launch-qwen.sh`;
+            }
+            return;
+        }
+
         // Check model source: HuggingFace, ModelScope, or Local
         const isLocalModel = this.elements.modelSourceLocal.checked;
         const isModelscope = this.elements.modelSourceModelscope.checked;

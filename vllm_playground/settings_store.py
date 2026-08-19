@@ -22,6 +22,8 @@ DEFAULTS: Dict[str, Any] = {
     "vllm_run_mode": "remote",
     "vllm_remote_url": "",
     "vllm_remote_api_key": "",
+    # Selected deployment profile name ("" = manual configuration)
+    "vllm_profile": "",
     "omni_run_mode": "remote",
     "omni_remote_url": "",
     "omni_remote_api_key": "",
