@@ -108,6 +108,11 @@ container_id: Optional[str] = None  # Container ID (for container mode)
 # control layer's container (qwen-svc), not the manager's default, and status /
 # log / stop calls must all target it or they act on the wrong container.
 current_container_name: Optional[str] = None
+# True when the container we are observing was started by the control layer and
+# merely adopted. The instance registry stops every *managed* instance when the
+# app shuts down, so an adopted container must not be recorded as managed --
+# otherwise quitting Playground stops a service Playground never started.
+current_container_adopted: bool = False
 vllm_process: Optional[asyncio.subprocess.Process] = None  # Process (for subprocess mode)
 vllm_running: bool = False
 current_run_mode: Optional[str] = None  # Track current run mode
@@ -2886,7 +2891,8 @@ async def start_server(config: VLLMConfig):
         latest_vllm_metrics, \
         metrics_timestamp, \
         remote_discovered_model_ids, \
-        current_container_name
+        current_container_name, \
+        current_container_adopted
 
     # Load the deployment profile before anything else: it decides the port, the
     # container name, and the image, all of which the checks below depend on.
@@ -3550,6 +3556,7 @@ async def start_server(config: VLLMConfig):
 
             container_id = container_info["id"]
             current_container_name = container_info["name"]
+            current_container_adopted = bool(container_info.get("adopted", False))
             vllm_running = True
             current_config = config
             server_start_time = datetime.now()
@@ -3605,7 +3612,9 @@ async def start_server(config: VLLMConfig):
                 ready_timeout = container_manager._parse_duration_seconds(
                     active_profile["host"].get("HEALTHCHECK_START_PERIOD", ""), 180
                 )
-            readiness = await container_manager.wait_for_ready(port=config.port, timeout=ready_timeout)
+            readiness = await container_manager.wait_for_ready(
+                port=config.port, timeout=ready_timeout, container_name=current_container_name
+            )
 
             if readiness.get("ready"):
                 await broadcast_log(f"[WEBUI] ✅ vLLM is ready! (took {readiness['elapsed_time']}s)", inst_id)
@@ -3707,7 +3716,8 @@ async def stop_server():
         current_api_model_id, \
         current_run_mode, \
         remote_discovered_model_ids, \
-        current_container_name
+        current_container_name, \
+        current_container_adopted
 
     # Check if server is running
     if not await check_vllm_server_running():
@@ -3728,6 +3738,7 @@ async def stop_server():
 
             container_id = None
             current_container_name = None
+            current_container_adopted = False
             await broadcast_log("[WEBUI] vLLM container stopped")
 
         else:  # subprocess mode
@@ -3847,6 +3858,23 @@ def _registry_container_name(config: VLLMConfig) -> Optional[str]:
     return container_id
 
 
+def _registry_managed(config: VLLMConfig) -> bool:
+    """Whether Playground owns this instance's lifecycle.
+
+    The registry stops every *managed* instance in its shutdown handler, so this
+    is the switch that decides whether quitting Playground takes the model
+    server down with it. A remote instance was never ours; neither was an
+    adopted container -- the control layer started it and keeps running it, and
+    Playground is only observing. Stopping it is available as an explicit user
+    action either way.
+    """
+    if config.run_mode == "remote":
+        return False
+    if config.run_mode == "container" and current_container_adopted:
+        return False
+    return True
+
+
 async def _auto_register_instance(config: VLLMConfig, model: Optional[str] = None) -> Optional[str]:
     """Register the just-started server as the active instance in the registry.
 
@@ -3896,6 +3924,7 @@ async def _auto_register_instance(config: VLLMConfig, model: Optional[str] = Non
             url=base_url,
             pid=vllm_process.pid if vllm_process else None,
             container_name=_registry_container_name(config),
+            managed=_registry_managed(config),
             gpu_devices=gpu_devices,
             config=config.model_dump(),
             health="healthy" if vllm_running else "unknown",
@@ -3915,7 +3944,7 @@ async def _auto_register_instance(config: VLLMConfig, model: Optional[str] = Non
             port=config.port,
             api_key=config.remote_api_key,
             run_mode=config.run_mode,
-            managed=config.run_mode != "remote",
+            managed=_registry_managed(config),
             pid=vllm_process.pid if vllm_process else None,
             container_name=_registry_container_name(config),
             gpu_devices=gpu_devices,
