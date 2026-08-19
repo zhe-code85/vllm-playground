@@ -104,6 +104,10 @@ app.mount("/assets", StaticFiles(directory=str(BASE_DIR / "assets")), name="asse
 
 # Global state
 container_id: Optional[str] = None  # Container ID (for container mode)
+# Name of the container currently being observed. With a profile this is the
+# control layer's container (qwen-svc), not the manager's default, and status /
+# log / stop calls must all target it or they act on the wrong container.
+current_container_name: Optional[str] = None
 vllm_process: Optional[asyncio.subprocess.Process] = None  # Process (for subprocess mode)
 vllm_running: bool = False
 current_run_mode: Optional[str] = None  # Track current run mode
@@ -722,6 +726,9 @@ from .settings_store import SettingsStore
 
 settings_store = SettingsStore()
 
+# Deployment profiles (control-layer .env files; see profile_store docstring)
+from . import profile_store
+
 
 def get_model_name_for_api() -> Optional[str]:
     """
@@ -864,6 +871,14 @@ class VLLMConfig(BaseModel):
     num_speculative_tokens: Optional[int] = None
     draft_tensor_parallel_size: Optional[int] = None
     prompt_lookup_max: Optional[int] = None
+    # Deployment profile name (a `.env.<name>` file in the control-layer dir).
+    # When set, every model/engine parameter above is ignored: the profile
+    # supplies them and the in-container launcher builds the vllm argv.
+    # Container mode only -- the host has no vLLM installation.
+    profile: Optional[str] = None
+    # Container image override. Falls back to the profile's QWEN_IMAGE, then to
+    # the manager's accelerator-based default.
+    image: Optional[str] = None
 
 
 class RemoteSelectModelRequest(BaseModel):
@@ -1115,7 +1130,9 @@ async def check_vllm_server_running() -> bool:
 
     if current_run_mode == "container":
         if CONTAINER_MODE_AVAILABLE and container_manager:
-            status = await container_manager.get_container_status()
+            # With a profile this is the control layer's container, not the
+            # manager's default; checking the default would report "not running".
+            status = await container_manager.get_container_status(container_name=current_container_name)
             return status.get("running", False)
         return False
 
@@ -2868,7 +2885,27 @@ async def start_server(config: VLLMConfig):
         current_run_mode, \
         latest_vllm_metrics, \
         metrics_timestamp, \
-        remote_discovered_model_ids
+        remote_discovered_model_ids, \
+        current_container_name
+
+    # Load the deployment profile before anything else: it decides the port, the
+    # container name, and the image, all of which the checks below depend on.
+    active_profile = None
+    if config.profile:
+        if config.run_mode != "container":
+            raise HTTPException(
+                status_code=400,
+                detail="profile 模式仅支持容器运行 (run_mode=container)：宿主机没有安装 vLLM。",
+            )
+        active_profile = profile_store.load_profile(config.profile)
+        if active_profile is None:
+            raise HTTPException(status_code=404, detail=f"Profile not found: {config.profile}")
+        profile_port = active_profile["host"].get("VLLM_PORT")
+        if profile_port:
+            try:
+                config.port = int(profile_port)
+            except ValueError:
+                logger.warning(f"Profile has a non-numeric VLLM_PORT={profile_port!r}, ignoring")
 
     # If a server is already running, park it (keep process alive, clear globals)
     # so the new server can start on its own port.
@@ -2877,7 +2914,11 @@ async def start_server(config: VLLMConfig):
 
     # Safety net: if the requested port is in use (e.g. by a parked instance),
     # auto-allocate the next free port.
-    if config.run_mode != "remote":
+    # A profile pins the port, and under co-management a busy port is the normal
+    # case -- it means the control layer's container is already serving on it and
+    # we are about to adopt that container. Reallocating here would bind the
+    # wrong port and then poll the wrong one for readiness.
+    if config.run_mode != "remote" and not active_profile:
         registry = _ir_mod.instance_registry
         if registry and not registry._is_port_free(config.port):
             old_port = config.port
@@ -3041,7 +3082,20 @@ async def start_server(config: VLLMConfig):
     model_source = None
     model_display_name = None
 
-    if config.local_model_path:
+    if active_profile:
+        # The model lives inside the container at the profile's MODEL_PATH and is
+        # served under SERVED_MODEL_NAME. Neither the form's `model` field nor the
+        # host-side model directory is what API calls should address, so skip the
+        # local/HF validation below entirely -- there is nothing here to validate
+        # and nothing to download.
+        served = active_profile["container"].get("SERVED_MODEL_NAME")
+        model_source = served or active_profile["container"].get("MODEL_PATH") or config.model
+        model_display_name = served or active_profile["host"].get("MODEL_DIR") or model_source
+        config.served_model_name = served or config.served_model_name
+        await broadcast_log(f"[WEBUI] Model (from profile): {model_display_name}")
+        if active_profile["host"].get("MODEL_DIR"):
+            await broadcast_log(f"[WEBUI] Model directory: {active_profile['host']['MODEL_DIR']}")
+    elif config.local_model_path:
         # Using local model - validate with comprehensive validation
         await broadcast_log("[WEBUI] Validating local model path...")
 
@@ -3469,14 +3523,33 @@ async def start_server(config: VLLMConfig):
                 "prompt_lookup_max": config.prompt_lookup_max,
             }
 
+            if active_profile:
+                # The manager short-circuits on "_profile" and generates no vllm
+                # arguments at all -- the model fields copied above are carried
+                # along only so the instance registry can display something. The
+                # profile decides every engine parameter.
+                vllm_config_dict["_profile"] = active_profile
+                vllm_config_dict["profile"] = config.profile
+                vllm_config_dict["gpu_device"] = config.gpu_device
+                target_container = active_profile["host"].get("CONTAINER_NAME")
+                target_image = config.image or active_profile["host"].get("QWEN_IMAGE")
+                await broadcast_log(f"[WEBUI] Profile: {config.profile} ({active_profile['path']})")
+                await broadcast_log(f"[WEBUI] Container: {target_container} (co-managed with the control layer)")
+            else:
+                target_container = None
+                target_image = config.image
+
             logger.info(
                 f"Container config: enable_tool_calling={config.enable_tool_calling}, tool_call_parser={config.tool_call_parser}"
             )
 
             # Start container
-            container_info = await container_manager.start_container(vllm_config_dict)
+            container_info = await container_manager.start_container(
+                vllm_config_dict, image=target_image, container_name=target_container
+            )
 
             container_id = container_info["id"]
+            current_container_name = container_info["name"]
             vllm_running = True
             current_config = config
             server_start_time = datetime.now()
@@ -3486,8 +3559,14 @@ async def start_server(config: VLLMConfig):
             current_served_model_name = config.served_model_name  # May be None
             current_api_model_id = None
 
-            # Show if container was reused or created new
-            if container_info.get("reused", False):
+            # Show if container was adopted, reused, or created new
+            if container_info.get("adopted", False):
+                await broadcast_log(
+                    f"[WEBUI] 🔗 Adopted running container {container_info['name']} ({container_id[:12]}) "
+                    f"— started by the control layer, left untouched. "
+                    f"Use an explicit rebuild to apply a different configuration."
+                )
+            elif container_info.get("reused", False):
                 await broadcast_log(f"[WEBUI] ⚡ Restarted existing container: {container_id[:12]} (fast!)")
             else:
                 await broadcast_log(f"[WEBUI] vLLM container created: {container_id[:12]}")
@@ -3518,7 +3597,15 @@ async def start_server(config: VLLMConfig):
             await broadcast_log(f"[WEBUI] ⏳ Waiting for vLLM to initialize and become ready...", inst_id)
             await broadcast_log(f"[WEBUI] This may take 30-120 seconds depending on model size...", inst_id)
 
-            readiness = await container_manager.wait_for_ready(port=config.port, timeout=180)
+            # 180s under-waits this deployment: ~90s warm, 3-5 min on a cold
+            # torch.compile cache. The profile's HEALTHCHECK_START_PERIOD is the
+            # same value compose uses for its healthcheck start_period.
+            ready_timeout = 180
+            if active_profile:
+                ready_timeout = container_manager._parse_duration_seconds(
+                    active_profile["host"].get("HEALTHCHECK_START_PERIOD", ""), 180
+                )
+            readiness = await container_manager.wait_for_ready(port=config.port, timeout=ready_timeout)
 
             if readiness.get("ready"):
                 await broadcast_log(f"[WEBUI] ✅ vLLM is ready! (took {readiness['elapsed_time']}s)", inst_id)
@@ -3619,7 +3706,8 @@ async def stop_server():
         current_served_model_name, \
         current_api_model_id, \
         current_run_mode, \
-        remote_discovered_model_ids
+        remote_discovered_model_ids, \
+        current_container_name
 
     # Check if server is running
     if not await check_vllm_server_running():
@@ -3634,10 +3722,12 @@ async def stop_server():
         elif current_run_mode == "container":
             await broadcast_log("[WEBUI] Stopping vLLM container...")
 
-            # Stop container
-            result = await container_manager.stop_container()
+            # Stop container. Under co-management this is the control layer's
+            # container, so it must be the one we actually stop.
+            result = await container_manager.stop_container(container_name=current_container_name)
 
             container_id = None
+            current_container_name = None
             await broadcast_log("[WEBUI] vLLM container stopped")
 
         else:  # subprocess mode
@@ -3742,6 +3832,21 @@ async def api_remote_select_model(body: RemoteSelectModelRequest):
 # =============================================================================
 
 
+def _registry_container_name(config: VLLMConfig) -> Optional[str]:
+    """What to record as the instance's container.
+
+    A profile names a real container that both Playground and the control-layer
+    scripts operate on, so record that name -- it is what the user would type
+    into `docker logs`. Without a profile, keep the upstream behaviour of
+    recording the container id.
+    """
+    if config.run_mode != "container":
+        return None
+    if config.profile and current_container_name:
+        return current_container_name
+    return container_id
+
+
 async def _auto_register_instance(config: VLLMConfig, model: Optional[str] = None) -> Optional[str]:
     """Register the just-started server as the active instance in the registry.
 
@@ -3790,7 +3895,7 @@ async def _auto_register_instance(config: VLLMConfig, model: Optional[str] = Non
             model=model or config.model,
             url=base_url,
             pid=vllm_process.pid if vllm_process else None,
-            container_name=container_id if config.run_mode == "container" else None,
+            container_name=_registry_container_name(config),
             gpu_devices=gpu_devices,
             config=config.model_dump(),
             health="healthy" if vllm_running else "unknown",
@@ -3812,7 +3917,7 @@ async def _auto_register_instance(config: VLLMConfig, model: Optional[str] = Non
             run_mode=config.run_mode,
             managed=config.run_mode != "remote",
             pid=vllm_process.pid if vllm_process else None,
-            container_name=container_id if config.run_mode == "container" else None,
+            container_name=_registry_container_name(config),
             gpu_devices=gpu_devices,
             config=config.model_dump(),
             health="healthy" if vllm_running else "unknown",
@@ -4234,7 +4339,7 @@ async def read_logs_container(instance_id: str):
     try:
         await broadcast_log("[WEBUI] Starting log stream from container...", instance_id)
 
-        async for log_line in container_manager.stream_logs():
+        async for log_line in container_manager.stream_logs(container_name=current_container_name):
             if log_line:
                 line = log_line.strip()
                 if line:
@@ -5293,6 +5398,36 @@ async def list_models():
     ]
 
     return {"models": common_models}
+
+
+@app.get("/api/profiles")
+async def get_profiles():
+    """
+    List deployment profiles available on this host.
+
+    A profile is a `.env.<name>` file in the control-layer directory -- the same
+    file the control-layer shell scripts source. Selecting one in the UI hands
+    every model and engine parameter to that file; the UI keeps only the
+    runtime-environment choices (accelerator, GPU device, image).
+    """
+    return {
+        "profiles": profile_store.list_profiles(),
+        "dir": str(profile_store.get_profile_dir()),
+    }
+
+
+@app.get("/api/profiles/{name}")
+async def get_profile(name: str):
+    """
+    Return one profile's parsed contents for display, with secrets redacted.
+
+    Read-only: the UI shows these values, it does not edit them. Editing happens
+    in the .env file itself so the control-layer scripts see the same change.
+    """
+    profile = profile_store.load_profile(name)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    return profile_store.redacted(profile)
 
 
 @app.get("/api/recipes")
