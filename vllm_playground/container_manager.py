@@ -14,6 +14,8 @@ import subprocess
 import time
 from typing import Optional, Dict, Any, AsyncIterator
 
+from . import profile_store
+
 logger = logging.getLogger(__name__)
 
 
@@ -203,6 +205,118 @@ class VLLMContainerManager:
 
         return None
 
+    # Path the control-layer launcher is mounted at inside the container.
+    LAUNCHER_MOUNT_PATH = "/opt/control/launch-qwen.sh"
+
+    def _parse_duration_seconds(self, value: str, default: int) -> int:
+        """
+        Convert a compose-style duration ("120s", "5m", "900") to whole seconds.
+
+        Used for STOP_GRACE_PERIOD and HEALTHCHECK_START_PERIOD, which the
+        control-layer .env files write with a unit suffix but `docker run` and
+        our readiness poll both want as a bare integer.
+        """
+        if not value:
+            return default
+        text = str(value).strip().lower()
+        multipliers = {"s": 1, "m": 60, "h": 3600}
+        suffix = text[-1:]
+        multiplier = 1
+        if suffix in multipliers:
+            multiplier = multipliers[suffix]
+            text = text[:-1]
+        try:
+            return int(float(text) * multiplier)
+        except ValueError:
+            logger.warning(f"Could not parse duration {value!r}, using {default}s")
+            return default
+
+    def build_profile_container_config(self, vllm_config: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build container configuration from a deployment profile.
+
+        Unlike the form-driven path, this generates *no* vllm arguments at all.
+        The profile's container-side keys are passed through as environment
+        variables and the in-container launcher (`launch-qwen.sh`) assembles the
+        argv from them. That launcher is the same file the control layer uses,
+        so a container started here is equivalent to one started by
+        `docker compose`, down to flags this UI has no field for
+        (--mm-encoder-attn-backend, --kv-cache-dtype, --reasoning-parser, ...).
+
+        Host-side profile keys become `docker run` flags so the two paths also
+        match on restart policy, log rotation, mounts and stop grace period.
+
+        UI values win over profile values wherever both exist -- the UI owns the
+        runtime environment, the profile owns the model.
+        """
+        host = profile.get("host", {})
+        container = profile.get("container", {})
+
+        # Container-side keys pass through untouched. profile_store has already
+        # dropped empty values, which matters: launch-qwen.sh tests them with
+        # `[ -n "$X" ]`, so an empty value must not reach the container.
+        env = []
+        for key in sorted(container):
+            env.extend(["-e", f"{key}={container[key]}"])
+
+        # Model directory, vLLM compile cache, and the launcher itself.
+        volumes = []
+        model_dir = host.get("MODEL_DIR")
+        if model_dir:
+            model_path = container.get("MODEL_PATH", "/model")
+            volumes.extend(["-v", f"{model_dir}:{model_path}:ro"])
+        else:
+            logger.warning("Profile has no MODEL_DIR - the container will have no model mounted")
+
+        cache_dir = host.get("VLLM_CACHE_DIR")
+        if cache_dir:
+            volumes.extend(["-v", f"{cache_dir}:/root/.cache/vllm:rw"])
+
+        launcher = str(profile_store.get_profile_dir() / "launch-qwen.sh")
+        volumes.extend(["-v", f"{launcher}:{self.LAUNCHER_MOUNT_PATH}:ro"])
+
+        # launch-qwen.sh always listens on 8000 inside the container.
+        host_port = vllm_config.get("port") or host.get("VLLM_PORT", "8000")
+        bind_host = host.get("VLLM_BIND_HOST", "0.0.0.0")
+        ports = ["-p", f"{bind_host}:{host_port}:8000"]
+
+        # Host-side flags that the form-driven path has no equivalent for.
+        run_flags = []
+
+        restart_policy = host.get("RESTART_POLICY")
+        if restart_policy:
+            run_flags.extend(["--restart", restart_policy])
+
+        stop_grace = host.get("STOP_GRACE_PERIOD")
+        if stop_grace:
+            run_flags.extend(["--stop-timeout", str(self._parse_duration_seconds(stop_grace, 120))])
+
+        log_max_size = host.get("LOG_MAX_SIZE")
+        log_max_file = host.get("LOG_MAX_FILE")
+        if log_max_size or log_max_file:
+            run_flags.extend(["--log-driver", "json-file"])
+            if log_max_size:
+                run_flags.extend(["--log-opt", f"max-size={log_max_size}"])
+            if log_max_file:
+                run_flags.extend(["--log-opt", f"max-file={log_max_file}"])
+
+        # --shm-size is deliberately not emitted: it is incompatible with
+        # --ipc=host, which start_container always sets. docker-compose.qwen.yml
+        # declares both but docker ignores shm_size under ipc: host, so
+        # honouring --ipc=host is what actually matches the control layer.
+        if host.get("SHM_SIZE"):
+            logger.info(f"Profile sets SHM_SIZE={host['SHM_SIZE']}, ignored because --ipc=host takes precedence")
+
+        return {
+            "environment": env,
+            "volumes": volumes,
+            "ports": ports,
+            "vllm_args": [],  # the launcher builds the argv, not us
+            "run_flags": run_flags,
+            "entrypoint": ["/bin/bash"],
+            "command": [self.LAUNCHER_MOUNT_PATH],
+        }
+
     def build_container_config(self, vllm_config: Dict[str, Any]) -> Dict[str, Any]:
         """
         Build container configuration from vLLM config
@@ -214,6 +328,12 @@ class VLLMContainerManager:
         Returns:
             Dictionary with container configuration (environment, volumes, ports)
         """
+        # A profile takes over the whole configuration - see
+        # build_profile_container_config for why none of the below applies.
+        profile = vllm_config.get("_profile")
+        if profile:
+            return self.build_profile_container_config(vllm_config, profile)
+
         # Prepare environment variables for the container's start_vllm.sh script
         env = []
 
@@ -403,24 +523,31 @@ class VLLMContainerManager:
         config_str = json.dumps(vllm_config, sort_keys=True)
         return hashlib.md5(config_str.encode()).hexdigest()
 
-    async def _should_recreate_container(self, vllm_config: Dict[str, Any], expected_image: str) -> bool:
+    async def _should_recreate_container(
+        self, vllm_config: Dict[str, Any], expected_image: str, container_name: Optional[str] = None
+    ) -> bool:
         """
         Check if container needs to be recreated due to config or image change
 
         Args:
             vllm_config: New vLLM configuration
             expected_image: The container image that should be used
+            container_name: Container to inspect (default: CONTAINER_NAME). Must be
+                passed whenever start_container targets a non-default name, or this
+                inspects one container while the caller destroys another.
 
         Returns:
             True if container should be recreated, False if can reuse existing
         """
+        target_name = container_name or self.CONTAINER_NAME
         try:
             # Check if container exists and get both config hash and image
             result = await self._run_podman_cmd_async(
                 "inspect",
-                self.CONTAINER_NAME,
+                target_name,
                 "--format",
-                '{{index .Config.Labels "vllm.config.hash"}}|{{.Config.Image}}|{{index .Config.Labels "vllm.image"}}',
+                '{{index .Config.Labels "vllm.config.hash"}}|{{.Config.Image}}'
+                '|{{index .Config.Labels "vllm.image"}}|{{.State.Status}}',
                 check=False,
             )
 
@@ -429,18 +556,32 @@ class VLLMContainerManager:
                 logger.info("Container doesn't exist - will create new container")
                 return True
 
-            # Parse the output: stored_hash|container_image|stored_image_label
+            # Parse the output: stored_hash|container_image|stored_image_label|state
             output = result.stdout.strip()
             parts = output.split("|")
             stored_hash = parts[0] if len(parts) > 0 else ""
             container_image = parts[1] if len(parts) > 1 else ""
             stored_image_label = parts[2] if len(parts) > 2 else ""
+            state = parts[3] if len(parts) > 3 else ""
 
-            # Use the stored image label if available, otherwise use container image
-            stored_image = stored_image_label if stored_image_label else container_image
+            # A running container with no config-hash label was started by
+            # something else -- the control layer's compose file or
+            # start-qwen.sh. Adopt it for observation rather than destroying a
+            # live service to apply a config it may already be running.
+            # Applying a new config is then an explicit user action.
+            if state == "running" and not stored_hash:
+                logger.info(
+                    f"Container '{target_name}' is running but was not started by Playground "
+                    f"(no vllm.config.hash label) - adopting it instead of recreating. "
+                    f"Use the explicit rebuild action to apply a different configuration."
+                )
+                return False
 
             # Calculate current config hash
             current_hash = await self._get_container_config_hash(vllm_config)
+
+            # Use the stored image label if available, otherwise use container image
+            stored_image = stored_image_label if stored_image_label else container_image
 
             # Check if config changed
             if stored_hash != current_hash:
@@ -560,7 +701,20 @@ class VLLMContainerManager:
         Returns:
             Dictionary with container info (id, name, status, ready, etc.)
         """
-        target_name = container_name or self.CONTAINER_NAME
+        profile = vllm_config.get("_profile")
+        profile_host = profile.get("host", {}) if profile else {}
+        # NVIDIA_VISIBLE_DEVICES is a container-side key (the container needs it
+        # too) but is also read here to build --gpus, so both sections are needed.
+        profile_container = profile.get("container", {}) if profile else {}
+
+        # Precedence: explicit argument, then the profile, then our default.
+        # With a profile naming the control layer's container, Playground and
+        # the control-layer scripts manage the same container.
+        target_name = container_name or profile_host.get("CONTAINER_NAME") or self.CONTAINER_NAME
+
+        # This model needs ~90s to load with a warm compile cache and 3-5 min on a
+        # cold one, so wait_for_ready's 120s default would report a false failure.
+        ready_timeout = self._parse_duration_seconds(profile_host.get("HEALTHCHECK_START_PERIOD", ""), 120)
 
         use_cpu = vllm_config.get("use_cpu", False)
         accelerator = vllm_config.get("accelerator", "nvidia")
@@ -568,14 +722,18 @@ class VLLMContainerManager:
         logger.info(f"Starting vLLM in {mode_name} mode (container: {target_name})")
 
         if image is None:
-            # Auto-select appropriate image based on CPU/GPU mode and accelerator
-            image = self.get_default_image(use_cpu=use_cpu, accelerator=accelerator)
-            logger.info(f"Using container image: {image}")
+            # Prefer the profile's image, then auto-select by CPU/GPU mode
+            image = profile_host.get("QWEN_IMAGE")
+            if image:
+                logger.info(f"Using container image from profile: {image}")
+            else:
+                image = self.get_default_image(use_cpu=use_cpu, accelerator=accelerator)
+                logger.info(f"Using container image: {image}")
 
         try:
             # Check if we need to recreate the container
             # Pass expected image to detect CPU/GPU mode changes
-            should_recreate = await self._should_recreate_container(vllm_config, image)
+            should_recreate = await self._should_recreate_container(vllm_config, image, container_name=target_name)
 
             if not should_recreate:
                 # Container exists with same config - just restart it
@@ -602,18 +760,26 @@ class VLLMContainerManager:
                     id_result = await self._run_podman_cmd_async("inspect", target_name, "--format", "{{.Id}}")
                     container_id = id_result.stdout.strip()
 
+                # A missing config-hash label means this container came from the
+                # control layer, not from us; surface that so the UI can say so.
+                label_result = await self._run_podman_cmd_async(
+                    "inspect", target_name, "--format", '{{index .Config.Labels "vllm.config.hash"}}', check=False
+                )
+                adopted = label_result.returncode == 0 and not label_result.stdout.strip()
+
                 result = {
                     "id": container_id,
                     "name": target_name,
                     "status": "running",
                     "image": image,
                     "reused": True,
+                    "adopted": adopted,
                 }
 
                 # Wait for readiness if requested
                 if wait_ready:
                     port = vllm_config.get("port", 8000)
-                    readiness = await self.wait_for_ready(port=port)
+                    readiness = await self.wait_for_ready(port=port, timeout=ready_timeout)
                     result.update(readiness)
 
                 return result
@@ -622,7 +788,7 @@ class VLLMContainerManager:
             logger.info("Configuration changed or no container - creating new container")
 
             # Stop and remove existing container if it exists
-            await self.stop_container(remove=True, container_name=container_name)
+            await self.stop_container(remove=True, container_name=target_name)
 
             # Pull image first (with progress streaming)
             await self._pull_image_with_progress(image)
@@ -637,7 +803,10 @@ class VLLMContainerManager:
             logger.info(f"Environment: {config['environment']}")
             logger.info(f"Volumes: {config['volumes']}")
             logger.info(f"Ports: {config['ports']}")
-            logger.info(f"Using container's default entrypoint (start_vllm.sh)")
+            if config.get("entrypoint"):
+                logger.info(f"Entrypoint: {config['entrypoint']} {config.get('command', [])}")
+            else:
+                logger.info(f"Using container's default entrypoint (start_vllm.sh)")
 
             # Build podman run command
             podman_cmd = [
@@ -654,6 +823,21 @@ class VLLMContainerManager:
                 "--label",
                 f"vllm.image={image}",
             ]
+
+            if profile:
+                podman_cmd.extend(["--label", f"vllm.profile={profile.get('name', '')}"])
+
+            # Override the image entrypoint when a profile supplies its own launcher.
+            # docker/podman only accept a single --entrypoint executable; any
+            # arguments to it belong after the image name (see "command" below).
+            entrypoint = config.get("entrypoint") or []
+            if entrypoint:
+                podman_cmd.extend(["--entrypoint", entrypoint[0]])
+                if len(entrypoint) > 1:
+                    logger.warning(f"Ignoring extra entrypoint parts {entrypoint[1:]} - pass them as command instead")
+
+            # Host-side flags from the profile (restart policy, log rotation, ...)
+            podman_cmd.extend(config.get("run_flags", []))
 
             # Add GPU passthrough if not in CPU mode
             use_cpu = vllm_config.get("use_cpu", False)
@@ -691,7 +875,12 @@ class VLLMContainerManager:
                     logger.info("Google Cloud TPU passthrough enabled for container (privileged mode)")
                 else:
                     # NVIDIA CUDA GPU support (default)
-                    gpu_device = vllm_config.get("gpu_device")
+                    # UI selection wins; fall back to the profile's device list.
+                    gpu_device = (
+                        vllm_config.get("gpu_device")
+                        or profile_host.get("NVIDIA_VISIBLE_DEVICES")
+                        or profile_container.get("NVIDIA_VISIBLE_DEVICES")
+                    )
                     if self.runtime == "docker":
                         gpu_spec = f'"device={gpu_device}"' if gpu_device else "all"
                         podman_cmd.extend(["--gpus", gpu_spec])
@@ -720,6 +909,12 @@ class VLLMContainerManager:
             # Add image
             podman_cmd.append(image)
 
+            # Arguments to the overridden entrypoint (the profile's launcher).
+            # Mutually exclusive with vllm_args below: the launcher builds the
+            # argv itself, so a profile config carries an empty vllm_args.
+            if config.get("command"):
+                podman_cmd.extend(config["command"])
+
             # Add vLLM command-line arguments
             # NVIDIA vllm-openai image has entrypoint, but AMD/TPU images need explicit command
             if config.get("vllm_args"):
@@ -742,12 +937,13 @@ class VLLMContainerManager:
                 "status": "started",
                 "image": image,
                 "reused": False,
+                "adopted": False,
             }
 
             # Wait for readiness if requested
             if wait_ready:
                 port = vllm_config.get("port", 8000)
-                readiness = await self.wait_for_ready(port=port)
+                readiness = await self.wait_for_ready(port=port, timeout=ready_timeout)
                 result.update(readiness)
 
             return result
