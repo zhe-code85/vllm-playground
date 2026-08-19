@@ -192,6 +192,26 @@
                                 </div>
                             </div>
 
+                            <!-- Deployment Profile - Shown in Container mode only.
+                                 A profile is a .env file the control-layer scripts also read;
+                                 selecting one hands every model/engine parameter to that file
+                                 and leaves only the runtime environment on this form. -->
+                            <div id="profile-group" style="display: none;">
+                                <div class="form-group">
+                                    <label for="profile-select">Deployment Profile</label>
+                                    <select id="profile-select" class="form-control">
+                                        <option value="">Manual configuration (no profile)</option>
+                                    </select>
+                                    <small class="form-help" id="profile-help-text">Model and engine parameters come from the profile file; this form keeps only the runtime environment.</small>
+                                </div>
+                                <div class="form-group" id="container-image-group" style="display: none;">
+                                    <label for="container-image">Container Image (optional)</label>
+                                    <input type="text" id="container-image" class="form-control" placeholder="leave empty to use the profile's image">
+                                    <small class="form-help">Overrides the profile's QWEN_IMAGE.</small>
+                                </div>
+                                <div id="profile-summary" class="model-info-box" style="display: none; margin-bottom: 14px; padding: 10px; background: #1e293b; border-radius: 6px; border-left: 3px solid #10b981;"></div>
+                            </div>
+
                             <!-- Remote vLLM Settings - Shown in Remote mode (default) -->
                             <div id="remote-settings-group">
                                 <div class="form-group">
